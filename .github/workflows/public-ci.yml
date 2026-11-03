@@ -1,0 +1,125 @@
+# Self-contained CI for a public repository: no custom secrets, no privileged PR
+# events, no private reusable dependencies. Same pinned actions as enterprise.
+name: Public CI
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: ["20", "24"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node }}
+      # Zero runtime dependencies: the tests need nothing installed.
+      - run: node --test test/*.test.js
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install verified Gitleaks release
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan full history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --config .gitleaks.toml --exit-code 1 .'
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
+
+  package:
+    # Proves the tarball a consumer installs: exact file allow-list, then a
+    # scratch project imports both entry points.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - name: Pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+      - name: Check pack file allow-list
+        run: |
+          tar -tzf "$RUNNER_TEMP"/pack/*.tgz | sed 's#^package/##' | sort > "$RUNNER_TEMP/files.txt"
+          cat "$RUNNER_TEMP/files.txt"
+          unexpected=$(grep -vE '^(src/[A-Za-z0-9_.-]+\.js|index\.d\.ts|browser\.d\.ts|LICENSE|README\.md|package\.json)$' "$RUNNER_TEMP/files.txt" || true)
+          if [ -n "$unexpected" ]; then echo "::error::unexpected files in tarball:"; echo "$unexpected"; exit 1; fi
+          for f in package.json index.d.ts browser.d.ts LICENSE README.md src/index.js src/browser.js; do
+            grep -qx "$f" "$RUNNER_TEMP/files.txt" || { echo "::error::missing from tarball: $f"; exit 1; }
+          done
+      - name: Install into a scratch consumer project
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$(ls "$RUNNER_TEMP"/pack/*.tgz)"
+          node --input-type=module -e "await import('@alphabros/error-beacon'); await import('@alphabros/error-beacon/browser'); console.log('entry points import')"
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install verified actionlint release
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      - name: Lint workflows
+        run: '"$RUNNER_TEMP/actionlint" -color'
+
+  summary:
+    if: always()
+    needs: [test, gitleaks, audit, package, actionlint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce every gate
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$CI_NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          failed=$(echo "$CI_NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')
+          if [ -n "$failed" ]; then echo "::error::gates not green: $failed"; exit 1; fi
