@@ -1,0 +1,61 @@
+{
+  "name": "@alphabros/error-beacon",
+  "version": "0.1.0",
+  "description": "First-party production error beacon (ADR-0058): one scrub function, one payload schema, reporters and a Loki forwarder shared by every Studio app.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alpha Bros (https://alphabros.eu)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShipFast-Syndicate/error-beacon.git"
+  },
+  "homepage": "https://github.com/ShipFast-Syndicate/error-beacon#readme",
+  "bugs": {
+    "url": "https://github.com/ShipFast-Syndicate/error-beacon/issues"
+  },
+  "keywords": [
+    "error-reporting",
+    "gdpr",
+    "pii",
+    "scrub",
+    "loki",
+    "alphabros"
+  ],
+  "packageManager": "pnpm@10.34.3",
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./browser": {
+      "types": "./browser.d.ts",
+      "default": "./src/browser.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "index.d.ts",
+    "browser.d.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
+    "conventional-changelog-conventionalcommits": "^9.3.1",
+    "semantic-release": "^25.0.9"
+  }
+}

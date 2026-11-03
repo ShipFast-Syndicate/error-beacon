@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  # Nightly drift run: catches new advisories and runner image drift between merges.
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # Keep this caller ID and the reusable summary ID: branch rules require ci / summary.
+    uses: ./.github/workflows/public-ci.yml

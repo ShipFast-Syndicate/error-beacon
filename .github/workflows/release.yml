@@ -1,0 +1,265 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  # Rehearses publication from any ref without touching the registry: builds,
+  # checks the version against npm and runs `npm publish --dry-run`. Real
+  # publication only ever follows a semantic-release push to main.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Rehearse the publish job (`npm publish --dry-run`). Only true is accepted.
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+# Two fast merges to `main` must not race semantic-release into a double
+# tag/publish (security audit W3). `cancel-in-progress: false` — a release
+# already in flight must run to completion, not be torn down mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Version, changelog, tag and GitHub release locally: this public repository
+  # cannot call the private hub's reusable workflow. `@semantic-release/npm` runs with
+  # `npmPublish: false` — this job only bumps `package.json`'s version and
+  # writes the release commit/tag; it never touches the npm registry, so it
+  # needs no `NPM_TOKEN` at all (trusted publishing, no npm token anywhere —
+  # Bastien 2026-09-15). Only the token-generation step receives
+  # `RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`, which mint
+  # the installation token `@semantic-release/git` needs to push the release
+  # commit past the `main` branch ruleset.
+  release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate release-bot token
+        id: release-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # Keep the installation token scoped to this repository.
+          repositories: ${{ github.event.repository.name }}
+          # Request only what the release plugins use instead of inheriting
+          # every permission of the App installation (metadata: read is
+          # implicit): contents for the release commit, tag, notes and GitHub
+          # release (@semantic-release/git, @semantic-release/github);
+          # issues and pull-requests for the released comments/labels and the
+          # failure issue (@semantic-release/github). Nothing else.
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ steps.release-token.outputs.token }}
+          # The dedicated CI jobs already enforce local pre-push checks.
+          HUSKY: "0"
+        run: pnpm exec semantic-release
+
+  # npm publish via OIDC trusted publishing + provenance — no NPM_TOKEN.
+  # This runs as its own job so only publication carries OIDC permissions
+  # and the protected `npm` deployment environment.
+  #
+  # The semantic-release command exposes no "did a release happen"
+  # output, so this job always runs and gates every step on whether `release`
+  # actually produced a new `v*` tag at the tip of `main` — a no-op semantic-
+  # release run (e.g. a merge with no releasable commits) leaves this job a
+  # fast no-op rather than failing or force-publishing a stale version.
+  #
+  # Must run on a GitHub-hosted runner: npm's OIDC trusted-publishing flow is
+  # not available on self-hosted runners.
+  publish:
+    needs: release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      published: ${{ steps.published.outputs.published }}
+      version: ${{ steps.version-check.outputs.version }}
+    permissions:
+      id-token: write
+      contents: read
+    environment: npm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # `TAG` is untrusted (it comes from `git describe` against whatever the
+      # release job just tagged) — it is validated against a strict semver
+      # regex here, before it is trusted by any later step, and again passed
+      # through `env:` rather than interpolated into a `run:` string anywhere
+      # (GitHub Actions template-injection hardening: an expression
+      # substituted directly into a script is attacker-shell-controllable;
+      # reading the same value from an environment variable is not).
+      - name: Check for a new release tag
+        id: check
+        env:
+          SEMVER_RE: ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
+        run: |
+          git fetch --tags
+          if TAG=$(git describe --exact-match --tags HEAD 2>/dev/null) && [[ "$TAG" =~ $SEMVER_RE ]]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "${TAG:-}" ]; then
+              echo "refusing suspicious tag: $TAG"
+            fi
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout the released tag
+        if: steps.check.outputs.released == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          SEMVER_RE: ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
+        run: |
+          [[ "$TAG" =~ $SEMVER_RE ]] || { echo "refusing suspicious tag: $TAG"; exit 1; }
+          git checkout "refs/tags/$TAG" --
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: steps.check.outputs.released == 'true'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: steps.check.outputs.released == 'true'
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        if: steps.check.outputs.released == 'true'
+        run: pnpm install --frozen-lockfile
+
+      # npm's OIDC trusted-publishing flow requires npm >= 11.5.1. Pinned
+      # (not `npm@latest`) so a future npm release can't change what this
+      # job runs without a reviewed bump here.
+      - name: Update npm
+        if: steps.check.outputs.released == 'true'
+        run: npm i -g npm@12.0.2
+
+      # Makes a manual re-run of this job a true no-op: `npm view` a version
+      # that doesn't exist on the registry exits non-zero (treated here as
+      # "not published yet", not as a hard failure), so this only ever
+      # short-circuits the publish step, never the job.
+      - name: Check whether this version is already published
+        id: version-check
+        if: steps.check.outputs.released == 'true'
+        env:
+          VERSION_RE: ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          [[ "$VERSION" =~ $VERSION_RE ]] || { echo "refusing suspicious version: $VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "@alphabros/error-beacon@$VERSION" version >/dev/null 2>&1; then
+            echo "@alphabros/error-beacon@$VERSION is already on the registry — skipping publish."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with provenance
+        if: steps.check.outputs.released == 'true' && steps.version-check.outputs.exists != 'true'
+        run: npm publish --provenance --access public
+
+      - name: Record publication
+        id: published
+        if: steps.check.outputs.released == 'true' && steps.version-check.outputs.exists != 'true'
+        run: echo "published=true" >> "$GITHUB_OUTPUT"
+
+  # Installs what was just published, from the registry, into a scratch
+  # consumer project: proves the public artifact (not the local build) imports
+  # and runs. Retries cover registry propagation after `npm publish`.
+  post-release-smoke:
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - name: Install the published version into a scratch project
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+          VERSION_RE: ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
+        run: |
+          [[ "$VERSION" =~ $VERSION_RE ]] || { echo "refusing suspicious version: $VERSION"; exit 1; }
+          for attempt in 1 2 3 4 5 6; do
+            npm view "@alphabros/error-beacon@$VERSION" version >/dev/null 2>&1 && break
+            echo "waiting for @alphabros/error-beacon@$VERSION on the registry (attempt $attempt)"
+            sleep 30
+          done
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "@alphabros/error-beacon@$VERSION"
+          node --input-type=module -e "await import('@alphabros/error-beacon'); await import('@alphabros/error-beacon/browser'); console.log('entry points import')"
+
+  # Manual rehearsal of the publish job. Read-only token, no OIDC, no `npm`
+  # environment: it cannot publish even if the dry-run flag were dropped.
+  publish-dry-run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse anything but a dry run
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          [ "$DRY_RUN" = "true" ] || { echo "Only dry runs are dispatchable; real publication follows a release on main."; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Update npm
+        run: npm i -g npm@12.0.2
+      - name: Version check
+        env:
+          VERSION_RE: ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          [[ "$VERSION" =~ $VERSION_RE ]] || { echo "refusing suspicious version: $VERSION"; exit 1; }
+          LATEST=$(npm view @alphabros/error-beacon version 2>/dev/null || echo none)
+          if npm view "@alphabros/error-beacon@$VERSION" version >/dev/null 2>&1; then
+            echo "@alphabros/error-beacon@$VERSION is already published (latest: $LATEST); a real run would skip publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "@alphabros/error-beacon@$VERSION is not published yet (latest: $LATEST); a real run would publish it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish dry run
+        run: npm publish --dry-run --access public

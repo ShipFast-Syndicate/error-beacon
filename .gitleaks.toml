@@ -1,0 +1,11 @@
+title = "error-beacon gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Dependency lockfile and installed packages carry integrity hashes, not secrets"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)pnpm-lock\.yaml$''',
+]
